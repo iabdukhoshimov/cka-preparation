@@ -1,0 +1,9 @@
+[submodule "references/cka-certification-guide"]
+	path = references/cka-certification-guide
+	url = https://github.com/techiescamp/cka-certification-guide
+[submodule "references/CKA-Exercises"]
+	path = references/CKA-Exercises
+	url = https://github.com/chadmcrowell/CKA-Exercises
+[submodule "references/CKA-practice-exercises"]
+	path = references/CKA-practice-exercises
+	url = https://github.com/alijahnas/CKA-practice-exercises
