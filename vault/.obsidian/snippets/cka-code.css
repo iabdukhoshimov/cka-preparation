@@ -1,0 +1,29 @@
+/* CKA vault styling */
+
+/* 1. Wider page (Obsidian's own width variable) */
+body {
+  --file-line-width: 1300px;
+}
+
+/* 2. Code blocks: one row per line, the dark box scrolls sideways
+      so text never runs outside the background */
+.markdown-rendered pre {
+  overflow-x: auto !important;
+  white-space: pre !important;
+}
+.markdown-rendered pre > code {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  white-space: pre !important;
+  word-break: normal !important;
+  overflow-wrap: normal !important;
+  background: transparent !important;
+  font-size: 0.85em;
+}
+
+/* editing view (Ctrl+E) code blocks */
+.markdown-source-view.mod-cm6 .HyperMD-codeblock {
+  white-space: pre !important;
+  word-break: normal !important;
+}

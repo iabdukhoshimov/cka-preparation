@@ -1,0 +1,5 @@
+" Minimal YAML-friendly vim. Memorize these 4 lines; type them into ~/.vimrc on exam day.
+set expandtab tabstop=2 shiftwidth=2
+set number
+set autoindent
+syntax on

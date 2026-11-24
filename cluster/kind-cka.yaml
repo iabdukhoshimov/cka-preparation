@@ -1,0 +1,16 @@
+# 1 control-plane + 2 workers, no default CNI (we install Calico so NetworkPolicy is enforced).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: cka
+networking:
+  disableDefaultCNI: true
+  podSubnet: 192.168.0.0/16
+  serviceSubnet: 10.96.0.0/12
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # Host 30080 -> NodePort 30080 (for testing Services / Gateway from your browser)
+      - containerPort: 30080
+        hostPort: 30080
+  - role: worker
+  - role: worker
