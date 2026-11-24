@@ -53,6 +53,31 @@ Tags: 🔥 HIGH · 🟡 MEDIUM · 🧊 LOW
 ```
 On worker nodes: no `manifests/` content and no admin.conf, but kubelet + containerd are the same.
 
+### How each component runs (this decides HOW you debug it)
+| Component | Runs as | Config | Debug with |
+|---|---|---|---|
+| kube-apiserver, etcd, kube-scheduler, kube-controller-manager | **static pods** | `/etc/kubernetes/manifests/*.yaml` | `crictl ps -a`, `crictl logs`, `/var/log/pods/` |
+| kubelet | **systemd service** | `/var/lib/kubelet/config.yaml`, `kubeadm-flags.env`, `10-kubeadm.conf` drop-in | `systemctl status kubelet`, `journalctl -u kubelet` |
+| containerd | **systemd service** | `/etc/containerd/config.toml` | `systemctl status containerd` |
+| kube-proxy | **DaemonSet** | ConfigMap `kube-proxy` | `k -n kube-system logs ds/kube-proxy` |
+| CoreDNS | **Deployment** | ConfigMap `coredns` | `k -n kube-system logs -l k8s-app=kube-dns` |
+| CNI | DaemonSet (+ operator) | `/etc/cni/net.d`, `/opt/cni/bin` | `k -n calico-system get po` |
+
+### 🔥 What breaks when each one is down
+| Down | Symptom |
+|---|---|
+| kube-apiserver | `kubectl` → "connection refused ...:6443". Existing pods **keep running** |
+| etcd | the API server crash-loops / times out → same as above |
+| kube-scheduler | new pods stay **Pending with no events** (nobody even tries) |
+| kube-controller-manager | Deployments create no ReplicaSets/pods, scaling does nothing, dead nodes aren't handled, new namespaces get no `default` ServiceAccount |
+| kubelet (one node) | node **NotReady** after ~40 s. Its pods keep running, nothing new starts there. After ~5 min pods are evicted and recreated elsewhere (if they have controllers) |
+| kube-proxy (one node) | Services fail from that node. Pod IPs still work |
+| CoreDNS | names don't resolve, IPs work |
+| CNI | nodes NotReady, pods stuck in ContainerCreating |
+
+> [!danger]
+> Commonly reported: the API server manifest says `--etcd-servers=https://127.0.0.1:2380` (the **peer** port) instead of **2379** (the client port) → the API server crash-loops. `../troubleshoot/break.sh 4` practises exactly this.
+
 ---
 
 ## 2. Installing a cluster with kubeadm 🟡 MEDIUM (CRI/CNI prep pieces are 🔥)
@@ -86,16 +111,31 @@ containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml   # match the kubelet's systemd cgroup driver
 systemctl restart containerd ; systemctl enable containerd
 
-# 🔥 exam pattern: install a given .deb (e.g. cri-dockerd) and start it
+```
+
+### 🔥 Exam pattern: CRI prep with cri-dockerd (commonly reported)
+> "Install the cri-dockerd .deb in /root, enable and start the service, and set these sysctls: net.bridge.bridge-nf-call-iptables=1, net.ipv6.conf.all.forwarding=1, net.ipv4.ip_forward=1, net.netfilter.nf_conntrack_max=131072"
+```bash
 dpkg -i /root/cri-dockerd_*.deb
+systemctl list-unit-files | grep -i cri        # check the exact unit name
 systemctl enable --now cri-docker.service
 systemctl status cri-docker
+cat <<EOF > /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv4.ip_forward = 1
+net.netfilter.nf_conntrack_max = 131072
+EOF
+sysctl --system
+sysctl net.ipv4.ip_forward net.netfilter.nf_conntrack_max net.ipv6.conf.all.forwarding   # verify EVERY one
 ```
+cri-dockerd socket: `unix:///var/run/cri-dockerd.sock`. With several runtimes on a node, kubeadm needs `--cri-socket`.
 
 ### Step 3: packages (pkgs.k8s.io, one repo PER MINOR version)
 ```bash
-# /etc/apt/sources.list.d/kubernetes.list
-deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.37/deb/ /
+apt-get install -y apt-transport-https ca-certificates curl gpg
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.37/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.37/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
 apt-get update && apt-get install -y kubelet kubeadm kubectl && apt-mark hold kubelet kubeadm kubectl
 systemctl enable --now kubelet          # crash-loops until kubeadm init/join. That's normal
 ```
@@ -107,13 +147,14 @@ mkdir -p ~/.kube && cp /etc/kubernetes/admin.conf ~/.kube/config
 # install the CNI (06-networking.md §2), with the SAME pod CIDR
 k get no            # Ready after the CNI is up
 ```
+`kubeadm init` phases (good to recognize in its output): preflight → certs → kubeconfig → kubelet-start → control-plane (static pod manifests) → etcd → upload-config → mark-control-plane (taint) → bootstrap-token → addons (CoreDNS, kube-proxy). `[--control-plane-endpoint=<lb>:6443]` only for HA: it lets you add control planes later.
 
 ### Step 5: join workers
 ```bash
 kubeadm token create --print-join-command        # on the control plane (tokens expire after 24h)
 kubeadm join <cp-ip>:6443 --token abc.123 --discovery-token-ca-cert-hash sha256:...   # on the worker
 ```
-Reset a node completely: `kubeadm reset -f` (then clean `/etc/cni/net.d`, iptables).
+`kubeadm token list` shows the current tokens. Reset a node completely: `kubeadm reset -f` (then clean `/etc/cni/net.d`, iptables).
 
 ---
 
@@ -166,6 +207,9 @@ kubectl uncordon node01
 kubectl get no                                       # VERSION column shows the new version
 ```
 > [!warning]
+> Read the task: it may ask to upgrade **only the control plane**, or to an exact patch version. If `apt-get install` asks about config files, keep the current ones.
+
+> [!warning]
 > Traps: forgetting to change the apt repo (`apt-cache madison` shows only old versions), running `drain` **on the worker** (it has no kubeconfig; drain from the control plane), forgetting `uncordon`, forgetting to `exit` the ssh session.
 
 Docs page: "Upgrading kubeadm clusters" (bookmark it, the commands are copy-paste ready there).
@@ -188,6 +232,7 @@ k drain node01 --ignore-daemonsets --delete-emptydir-data
 k uncordon node01
 k get no                              # STATUS Ready,SchedulingDisabled while cordoned
 ```
+After `uncordon`, **pods don't move back automatically**. Only new pods land there. A drain blocked by a PDB keeps **retrying** (it looks stuck).
 > [!warning]
 > Drain is blocked by a **PodDisruptionBudget** that would be violated (`Cannot evict pod as it would violate the pod's disruption budget`). Check `k get pdb -A`. ⚽ A PDB = "the club must always have at least 2 goalkeepers available".
 When a node goes **down without draining**, its pods are marked for eviction after ~5 min (default `tolerationSeconds: 300` for `node.kubernetes.io/unreachable`/`not-ready`), then controllers recreate them elsewhere.
@@ -248,6 +293,19 @@ Other variants: if a task says etcd is **external** (a separate server/systemd s
 etcdctl ... member list -w table        # etcd cluster members
 etcdctl ... endpoint health
 ```
+If `etcdctl` isn't on the node you *could* run it inside the etcd pod (`k -n kube-system exec etcd-<node> -- etcdctl ...`), but then the snapshot lands **inside the container**. Prefer the node binary.
+> [!danger]
+> The task sometimes gives the cert paths **explicitly in the question**. Use exactly those paths.
+
+### Renewing certificates 🟡 MEDIUM
+```bash
+kubeadm certs check-expiration                   # every cert + CA, with the RESIDUAL TIME column
+kubeadm certs renew all                          # or one: kubeadm certs renew apiserver
+# static pods must restart to load the new certs:
+mkdir -p /tmp/m ; mv /etc/kubernetes/manifests/*.yaml /tmp/m/ ; sleep 20 ; mv /tmp/m/*.yaml /etc/kubernetes/manifests/
+cp /etc/kubernetes/admin.conf ~/.kube/config     # admin.conf was renewed too
+```
+`kubeadm upgrade apply` renews the certs automatically.
 
 ---
 
@@ -386,7 +444,39 @@ spec:
             properties:
               schedule: {type: string}
 ```
-Operators are usually installed with Helm or a manifest (`k apply -f operator.yaml` / `k create -f`), then you create the custom resource they watch.
+A CRD alone = **data only**. Objects are stored and validated against the `openAPIV3Schema` (e.g. `minimum: 1`, `required: [schedule]` → bad objects are rejected), but nothing *happens* until a **controller** acts on them.
+```bash
+k get crd -o name | grep cert-manager > /root/resources.yaml   # check the EXACT output format the task asks for
+k get bk -A ; k describe backup nightly                         # shortNames work like built-in ones
+```
+
+### Operators 🟡 MEDIUM
+**Operator = CRDs + a controller that encodes human operational knowledge** (install, upgrade, backup, failover of an app).
+🏥 Instead of a human DBA, a **robot DBA** watches "I want a 3-node Postgres with daily backups" (a custom resource) and makes it happen, repairing it when something breaks.
+Examples: cert-manager, Prometheus Operator, the **tigera-operator (Calico)**, CloudNativePG, Argo CD.
+Install = usually a Helm chart or a manifest (CRDs + a Deployment for the controller + RBAC), then you create the custom resources it watches.
+```bash
+k get po -A | grep -i operator
+k -n tigera-operator logs deploy/tigera-operator | tail     # an operator's logs = what it's doing
+k get installation default -o yaml                          # Calico's custom resource
+```
+
+### Extension interfaces: CRI, CNI, CSI 🔥 HIGH (curriculum: "understand extension interfaces")
+🔌 Kubernetes defines **standard sockets**, vendors build **plugs** that fit.
+| Interface | Socket for | Who calls it | Implementations | 🚗 |
+|---|---|---|---|---|
+| **CRI** | running containers | the **kubelet** (gRPC to a socket) | containerd, CRI-O, Docker via **cri-dockerd** | the **engine**: any brand that fits the mount |
+| **CNI** | pod networking | the container runtime (for the kubelet) | Calico, Cilium, Flannel | the **roads** |
+| **CSI** | volumes | kubelet + external controllers | AWS EBS, Ceph, local-path, NFS CSI | the **boot**: any size and brand |
+```bash
+cat /var/lib/kubelet/kubeadm-flags.env       # --container-runtime-endpoint=unix:///run/containerd/containerd.sock
+cat /etc/crictl.yaml ; crictl info | head
+k get nodes -o wide                          # CONTAINER-RUNTIME column: containerd://2.x
+ls /etc/cni/net.d /opt/cni/bin               # CNI
+k get csidrivers ; k get csinodes ; k get sc  # CSI: the SC provisioner = the CSI driver name
+```
+- **Docker Engine is not a CRI runtime.** dockershim was removed in 1.24, so Docker needs **cri-dockerd** (§2).
+- Images built with Docker run fine on containerd: they're OCI images.
 
 ---
 
@@ -396,7 +486,23 @@ Operators are usually installed with Helm or a manifest (`k apply -f operator.ya
 - **External etcd:** etcd on separate machines. More machines, more resilient.
 - etcd needs a **majority (quorum)**: 3 members tolerate 1 failure, 5 tolerate 2. Use odd numbers.
 - The API servers are active-active behind a load balancer (`--control-plane-endpoint`). The scheduler and controller-manager are **active-passive** via leader election (only one acts).
+- Extra control planes join with `kubeadm join ... --control-plane --certificate-key <key>` (the key comes from `kubeadm init --upload-certs`).
+- Leader election uses **Lease** objects: `k -n kube-system get lease`.
+
 ⚽ Three referees (etcd members) vote on every decision. If one is injured, 2 out of 3 can still decide. If two are injured, the match stops.
+
+---
+
+## 9b. Cluster and node info commands 🟡 MEDIUM
+```bash
+k get nodes -o wide                         # IPs, OS, kernel, container runtime, version
+k describe node <n>                         # conditions, taints, capacity/allocatable, pods
+k get --raw='/readyz?verbose'               # API server health checks, one line each
+k get --raw='/livez?verbose'
+k cluster-info ; k cluster-info dump | grep -m3 -E "cluster-cidr|service-cluster-ip-range"
+crictl ps ; crictl pods ; crictl images ; crictl logs <id> ; crictl inspect <id>   # on a node
+cat /etc/crictl.yaml                        # runtime-endpoint: unix:///run/containerd/containerd.sock
+```
 
 ---
 
@@ -414,6 +520,12 @@ Operators are usually installed with Helm or a manifest (`k apply -f operator.ya
 10. What does `includeSelectors: true` do in Kustomize labels, and why be careful?
 11. Which sysctls must be 1 for Kubernetes networking, and where do you persist them?
 12. Why `SystemdCgroup = true` in containerd?
+13. Which port does the API server use to reach etcd? What's on 2380?
+14. Which components are static pods on kubeadm, and which are systemd services?
+15. New pods stay Pending with **no events at all**. Which component?
+16. A Deployment was created, but no ReplicaSet appears. Which component?
+17. Can you upgrade from 1.35 to 1.37 directly?
+18. CRD vs operator? Which interface does the kubelet use to talk to containerd, and which gives pods their IPs?
 
 > [!success]- Answers
 > 1. Change the apt repo → upgrade kubeadm → `kubeadm upgrade plan` → `kubeadm upgrade apply v1.37.x` → drain → upgrade kubelet + kubectl → `daemon-reload` + restart kubelet → uncordon.
@@ -428,6 +540,12 @@ Operators are usually installed with Helm or a manifest (`k apply -f operator.ya
 > 10. It adds the labels to selectors too. Selectors of existing Deployments are immutable, so applying to existing objects can fail.
 > 11. `net.ipv4.ip_forward`, `net.bridge.bridge-nf-call-iptables` (+ ip6tables), in `/etc/sysctl.d/*.conf`, then `sysctl --system`.
 > 12. The kubelet uses the systemd cgroup driver by default. containerd must use the same, otherwise pods/kubelet misbehave.
+> 13. 2379 (client). 2380 is etcd ↔ etcd (peer).
+> 14. Static pods: apiserver, etcd, scheduler, controller-manager. Systemd: kubelet, containerd.
+> 15. kube-scheduler.
+> 16. kube-controller-manager.
+> 17. No. 1.35 → 1.36 → 1.37.
+> 18. A CRD = a new API type (data only). An operator = CRDs + a controller that acts on them. CRI (kubelet ↔ containerd); CNI gives pod IPs.
 
 ---
 

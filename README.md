@@ -18,7 +18,9 @@ source ~/.bashrc             # gives you: k, completion, $do, $now, kn <ns>
 
 | Path | What |
 |---|---|
-| `STUDY_PLAN.md` | 4-week plan with checkboxes, mapped to the 5 exam domains |
+| `notes/` | 11 topic notes (analogies, annotated YAML, traps, self-checks, mini-drills). Start at `notes/README.md` |
+| `vault/` | the same notes as an Obsidian vault (open the folder in Obsidian). Rebuild after editing notes: `python3 vault/build-vault.py` |
+| `STUDY_PLAN.md` | the sprint plan with checkboxes, mapped to the 5 exam domains |
 | `drills/DRILLS.md` | ~25 timed tasks per domain with hidden solutions |
 | `troubleshoot/` | `break.sh <n>` breaks the cluster, `check.sh <n>` verifies your fix, `SOLUTIONS.md` |
 | `setup/` | installer, exam-style bashrc + vimrc |

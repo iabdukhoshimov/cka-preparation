@@ -22,6 +22,7 @@ tags:
 | 8 | [[05-storage]] | Storage | 10% |
 | 9 | [[06-networking]] | Services & Networking | 20% |
 | 10 | [[08-troubleshooting-and-logs]] | Troubleshooting | **30%** |
+| 11 | [[11-exam-tips-and-final-plan]] | exam day | read twice |
 
 ## 🏋️ Practice
 - [[Drills]]: timed tasks per domain, solutions hidden

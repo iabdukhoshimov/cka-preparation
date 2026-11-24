@@ -3,7 +3,7 @@ tags:
   - cka/architecture
 ---
 
-← [[09-scheduling-placement]] · [[00 Home|🏠 Home]]
+← [[09-scheduling-placement]] · [[00 Home|🏠 Home]] · [[11-exam-tips-and-final-plan]] →
 
 # 10: Helm and Kustomize in depth
 
@@ -153,6 +153,7 @@ helm uninstall web -n web --keep-history
 ```
 > [!warning]
 > Without `--reuse-values`, an `upgrade` uses the chart defaults + **only** what you pass now. Values you `--set` at install time are **forgotten**. (🍽 A new order form doesn't keep the boxes you ticked last time.)
+
 > [!warning]
 > `rollback` creates a new revision number. It doesn't delete history.
 
@@ -187,6 +188,26 @@ dependencies:
 | upgrade to a newer chart | `helm search repo chart --versions` → `helm upgrade ... --version` |
 | roll back | `helm history` → `helm rollback rel N` |
 | which values were used | `helm get values rel -n ns` |
+
+### 🔥 Commonly reported task: Argo CD via `helm template`, without CRDs
+> "Add the Argo CD Helm repo as `argocd`. Generate a manifest at `/root/argo-helm.yaml` for chart version 7.7.3 in namespace `argocd`, **without installing CRDs**. Then install it as release `argocd`."
+```bash
+helm repo add argocd https://argoproj.github.io/argo-helm ; helm repo update
+helm search repo argocd/argo-cd --versions | head          # is 7.7.3 there?
+helm show values argocd/argo-cd --version 7.7.3 | grep -n -A3 -i crds     # find the real key: crds.install
+helm template argocd argocd/argo-cd --version 7.7.3 -n argocd --set crds.install=false > /root/argo-helm.yaml
+grep -c CustomResourceDefinition /root/argo-helm.yaml      # should be 0
+helm install argocd argocd/argo-cd --version 7.7.3 -n argocd --create-namespace --set crds.install=false
+```
+Two different "no CRDs" switches: `--skip-crds` only skips the chart's `crds/` **folder**. Charts that template their CRDs (like Argo CD) need **their own value** (`crds.install=false`). `helm show values | grep -i crd` tells you which.
+
+### Troubleshooting Helm
+| Problem | Check |
+|---|---|
+| `cannot re-use a name that is still in use` | `helm list -A -a`. Upgrade instead, or uninstall first |
+| a value didn't change anything | wrong key path → `helm show values`, then `helm get values rel -n ns` |
+| `release: not found` | wrong `-n` namespace (`helm list` without `-A` shows only the current ns) |
+| stuck `pending-upgrade` / `pending-install` | `helm rollback` to the last good revision, or uninstall |
 
 Your lab has Helm installed. Note: Bitnami's free images became limited in 2025, so pods may hit ImagePullBackOff. The Helm commands still work for practice. Another chart to practise with: `helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx` or the NGINX Gateway Fabric OCI chart your `up.sh` uses.
 
@@ -360,6 +381,7 @@ kustomize build overlays/prod               # standalone binary (same output; yo
 10. Strategic merge vs JSON6902: when do you use which?
 11. `k apply -f overlays/prod/` doesn't apply the overlay. Why?
 12. How do you remove a container defined in the base from an overlay?
+13. `--skip-crds` was used but CRDs still appear in the rendered output. Why?
 
 > [!success]- Answers
 > 1. `--set x=1` (`--set` beats `-f`, and among files the later one wins).
@@ -374,6 +396,7 @@ kustomize build overlays/prod               # standalone binary (same output; yo
 > 10. Strategic merge: add/change fields, containers by name, readable. JSON6902: precise ops (by index, removing, replacing a whole field).
 > 11. `-f` ignores kustomization.yaml. Use `k apply -k overlays/prod`.
 > 12. A strategic merge patch with `- name: <container>` + `$patch: delete` (or JSON6902 `op: remove` on its index).
+> 13. The chart templates its CRDs instead of keeping them in `crds/`. Disable them with the chart's own value (e.g. `--set crds.install=false`).
 
 ---
 
@@ -399,4 +422,4 @@ kustomize build overlays/prod               # standalone binary (same output; yo
 ```
 
 ---
-← [[09-scheduling-placement]] · [[00 Home|🏠 Home]]
+← [[09-scheduling-placement]] · [[00 Home|🏠 Home]] · [[11-exam-tips-and-final-plan]] →

@@ -28,6 +28,16 @@ Tags: 🔥 HIGH · 🟡 MEDIUM · 🧊 LOW
 | `reclaimPolicy: Retain` | when you leave, your stuff stays and the space is locked until the manager clears it | your luggage stays in the room until staff decide | your coat stays on the seat until staff collect it |
 | `WaitForFirstConsumer` | the valet only builds the space once they know **which car park your car is going to** | the room is assigned when you arrive, in the branch you arrived at | the seat is assigned when you walk in |
 
+```
+Pod ──uses──▶ PVC ──bound 1:1──▶ PV ──points to──▶ real storage (disk, NFS, cloud volume, hostPath)
+                      ▲
+          StorageClass creates the PV automatically (dynamic provisioning)
+```
+
+Who does what:
+- **Admin:** creates PVs (static) or StorageClasses (dynamic).
+- **Developer:** creates PVCs and uses them in pods. **Pods never refer to a PV directly.**
+
 ---
 
 ## 1. Volumes inside a pod 🔥 HIGH
@@ -81,6 +91,26 @@ spec:
 | hostPath | the node | ✅ | ❌ no (different node = different files) |
 | PVC (network/CSI) | until PVC/PV deleted | ✅ | ✅ (that's the point) |
 | PVC (local-path, kind) | until PVC/PV deleted | ✅ | ❌ (pod is pinned to that node) |
+
+### Classic exam shape: two containers sharing one emptyDir (log sidecar)
+```yaml
+spec:
+  containers:
+  - name: writer
+    image: busybox:1.36
+    command: ["sh", "-c", "while true; do date >> /data/log.txt; sleep 2; done"]
+    volumeMounts:
+    - {name: shared, mountPath: /data}
+  - name: reader
+    image: busybox:1.36
+    command: ["sh", "-c", "tail -F /input/log.txt"]
+    volumeMounts:
+    - {name: shared, mountPath: /input, readOnly: true}   # same volume, different path is fine
+  volumes:
+  - name: shared
+    emptyDir: {sizeLimit: 100Mi}
+```
+Check it with `k logs <pod> -c reader`. The **volume name** must match. The mountPaths don't have to.
 
 ---
 
@@ -165,6 +195,13 @@ spec:
 
 **One PV ↔ one PVC.** A 10Gi PV bound to a 1Gi PVC is fully used. The leftover 9Gi can't be shared.
 
+### PVC phases
+| Phase | Meaning / what to do |
+|---|---|
+| Pending | no matching PV → `k describe pvc` events. **With WaitForFirstConsumer, Pending is NORMAL until a pod uses it** |
+| Bound | ✅ (check the VOLUME column: is it the PV you meant?) |
+| Lost | the PV it was bound to disappeared |
+
 ### The storageClassName trap (🔥 explains most "Pending PVC" tasks)
 | PVC `storageClassName` | What happens |
 |---|---|
@@ -194,6 +231,29 @@ spec:
 ```
 > [!warning]
 > RWO + a Deployment with replicas on **different nodes** → the 2nd pod gets stuck in `ContainerCreating` (Multi-Attach error) on real block storage. On kind/local-path, pods are pinned to the PV's node.
+
+### 🔥 Exam pattern: "restore the MariaDB deployment" (commonly reported)
+> "A MariaDB deployment was deleted by mistake. A PV with the data still exists (Retain). Create a PVC named `mariadb` in ns `mariadb` (250Mi, RWO) that binds to that PV, then edit `~/mariadb-deploy.yaml` to use the PVC and apply it."
+
+```bash
+k get pv                                    # find the PV: Available? Released? note its class, size, accessModes
+k get pv <pv> -o yaml | grep -E "storageClassName|accessModes|storage|claimRef" -A1
+# if Released → k patch pv <pv> --type=json -p='[{"op":"remove","path":"/spec/claimRef"}]'
+cat <<EOF | k apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: mariadb, namespace: mariadb}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 250Mi}}
+  storageClassName: <SAME as the PV, or "" if the PV has none>
+EOF
+k -n mariadb get pvc                        # must be Bound to THAT PV (VOLUME column)
+vi ~/mariadb-deploy.yaml                    # volumes: - name: ... persistentVolumeClaim: {claimName: mariadb}
+k apply -f ~/mariadb-deploy.yaml
+k -n mariadb get po                         # Running and stable
+```
+Three things silently break it: a class mismatch (the PVC gets the default SC and a **new, empty** PV), the old `claimRef`, and requesting more than the PV's size.
 
 `spec` of a PVC is mostly **immutable** (only `resources.requests.storage` can grow). To change class/accessModes: export, delete, recreate. Delete the pod first, otherwise the PVC stays `Terminating` (protected while in use: `kubernetes.io/pvc-protection` finalizer).
 
@@ -292,7 +352,7 @@ Deleting the StatefulSet does **not** delete the PVCs (by default). Clean them u
 ### Analogy
 🚗 **CSI = the standard fuel nozzle.** Any fuel company (AWS EBS, Ceph, NetApp...) builds a nozzle that fits every car (Kubernetes). Before CSI, every company's code had to be built *into* the car ("in-tree" plugins), now removed/migrated.
 
-Know: CSI drivers run as pods (controller + node DaemonSet), `k get csidrivers`, `k get volumeattachments`, provisioner names look like `ebs.csi.aws.com`. Volume snapshots (`VolumeSnapshot`, `VolumeSnapshotClass`) are CSI CRDs.
+Know: CSI drivers run as pods (controller + node DaemonSet), `k get csidrivers`, `k get csinodes`, `k get volumeattachments`, provisioner names look like `ebs.csi.aws.com`. Volume snapshots (`VolumeSnapshot`, `VolumeSnapshotClass`) are CSI CRDs.
 
 ---
 
@@ -332,6 +392,8 @@ k get events --sort-by=.lastTimestamp | grep -i -E 'volume|claim'
 8. What PVC names does StatefulSet `web` with volumeClaimTemplate `www` and 3 replicas create?
 9. Difference between RWO and RWOP?
 10. An emptyDir pod's container crashes and restarts. Is the data still there? And if the pod is deleted?
+11. Is a PV namespaced? Is a PVC?
+12. Which annotation makes a StorageClass the default?
 
 > [!success]- Answers
 > 1. A. B has the wrong access mode, C has the wrong class (no class ≠ `manual`).
@@ -344,6 +406,8 @@ k get events --sort-by=.lastTimestamp | grep -i -E 'volume|claim'
 > 8. `www-web-0`, `www-web-1`, `www-web-2`.
 > 9. RWO = one **node** (several pods on that node may use it). RWOP = exactly one **pod**.
 > 10. Container restart: yes, data stays (emptyDir lives with the pod). Pod deleted: gone.
+> 11. PV: no (cluster-scoped). PVC: yes.
+> 12. `storageclass.kubernetes.io/is-default-class: "true"`
 
 ---
 

@@ -1,5 +1,9 @@
 # 10-day CKA sprint: Nov 15 → exam Nov 25 (k8s v1.37)
 
+> **UPDATE (Nov 24): the exam moved to Sat Nov 28.** The remaining days:
+> Nov 24–25 topic notes + labs (`notes/README.md`) · Nov 26 killer.sh #1 · Nov 27 killer.sh #2 + rest · Nov 28 exam.
+> Exam tips, speed toolkit, docs map & checklist: `notes/11-exam-tips-and-final-plan.md`.
+
 The level is intermediate: you've done KodeKloud Pro and Killercoda once each. The goal now is **speed, accuracy, and zero panic**, not learning new things.
 Pass mark is 66%. Aim for **≥ 85% on KodeKloud mocks** and **≥ 60% on killer.sh**, which is harder than the real exam.
 

@@ -1,7 +1,7 @@
 # 09: Pod placement: taints, tolerations, nodeSelector, affinity, anti-affinity, topology spread, nodeName
 
 Domain: **Workloads & Scheduling (15%)**, and "pod Pending" in **Troubleshooting (30%)**.
-PriorityClass, static pods and custom schedulers are in `02-...md`. Requests/limits are in `03-...md` §7.
+PriorityClass, static pods and custom schedulers are in `02-scheduling-admission-observability.md`. Requests/limits are in `03-application-lifecycle.md` §7.
 
 Tags: 🔥 HIGH · 🟡 MEDIUM · 🧊 LOW
 
@@ -287,7 +287,7 @@ Only **voluntary** evictions (drain, eviction API) respect it. A node crash does
 | `node(s) had volume node affinity conflict` | PV is tied to another node |
 | `didn't have free ports for the requested pod ports` | `hostPort` already used |
 | `Preemption is not helpful for scheduling` | info only, still the reasons above |
-| **no events at all** | scheduler down, or `schedulerName` → `02-...md` §2, `break.sh 1` |
+| **no events at all** | scheduler down, or `schedulerName` → `02-scheduling-admission-observability.md` §2, `break.sh 1` |
 
 ---
 

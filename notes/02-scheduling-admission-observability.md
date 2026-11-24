@@ -320,6 +320,7 @@ webhooks:
   failurePolicy: Fail                     # Fail = reject if the webhook is down | Ignore = let it through
 ```
 🔥 Troubleshooting angle: "Pods can't be created in any namespace" + a webhook with `failurePolicy: Fail` whose Service is down → that's the cause. `k get validatingwebhookconfigurations,mutatingwebhookconfigurations`
+
 💡 **ValidatingAdmissionPolicy** (GA since 1.30): validation rules written in CEL directly in YAML, with no webhook server. Know that it exists.
 
 ---

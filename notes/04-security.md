@@ -33,6 +33,18 @@ kubectl / pod / kubelet
 | securityContext | cabin rules: "no smoking, seatbelt on, you're not the pilot" | speed limiter, child lock | rules on kit: no jewellery, shin guards on | hygiene rules: hairnet, no jewellery |
 | Secret encryption at rest | luggage locked in the hold | documents in a locked glovebox | — | recipes in a locked safe |
 
+### Authentication: where does "who you are" come from? 🟡 MEDIUM
+**Kubernetes has NO "User" objects.** You can't `k create user`. A "user" is just a **name the API server trusts from a credential**:
+
+| Method | Identity comes from | Used by |
+|---|---|---|
+| **X.509 client certificate** | **CN = username**, **O = group(s)** | admins, kubeadm components, kubelets (`system:node:<name>`, group `system:nodes`) |
+| **ServiceAccount token** (JWT) | `system:serviceaccount:<ns>:<name>` | pods / programs inside the cluster |
+| OIDC | the token's claims | SSO setups (Google, Keycloak...) |
+| static token file, basic auth | deprecated/removed. Ignore | |
+
+Special groups: `system:masters` (**full admin, bypasses RBAC entirely**), `system:authenticated`, `system:unauthenticated`, `system:serviceaccounts`, `system:serviceaccounts:<ns>`.
+
 ---
 
 ## 1. TLS certificates in a kubeadm cluster 🟡 MEDIUM (cert paths in troubleshooting are 🔥)
@@ -155,7 +167,11 @@ k config set-context --current --namespace=dev   # your `kn dev` function
 k --kubeconfig=/root/other.conf get nodes        # use another file once
 export KUBECONFIG=~/.kube/config:/root/other.conf # merge several
 ```
-Default location: `~/.kube/config`. On a control plane, `/etc/kubernetes/admin.conf` is the admin kubeconfig.
+Lookup order: `--kubeconfig` flag → the `$KUBECONFIG` env var (can be a list `a:b`) → `~/.kube/config`.
+
+On a kubeadm control plane: `/etc/kubernetes/admin.conf` (group `kubeadm:cluster-admins`, the normal admin), `super-admin.conf` (`system:masters`, break-glass only), `controller-manager.conf`, `scheduler.conf`, and `kubelet.conf` on every node.
+
+🔥 Troubleshooting: `kubectl` says "connection refused" or "x509: certificate signed by unknown authority" → check the `server:` URL and port (6443) and the CA in the kubeconfig **before** blaming the cluster.
 
 ---
 
@@ -219,6 +235,23 @@ roleRef:                             # IMMUTABLE. To change the role: delete and
 
 Which apiGroup? → `k api-resources | grep -i deploy` (the APIVERSION column: `apps/v1` → group `apps`; `v1` → `""`; `networking.k8s.io/v1` → `networking.k8s.io`).
 
+### API groups to know 🔥 (a wrong apiGroup = the rule silently grants nothing)
+| Resources | apiGroup |
+|---|---|
+| pods, services, endpoints, configmaps, secrets, namespaces, nodes, PVs, PVCs, serviceaccounts, events | `""` (core) |
+| deployments, replicasets, daemonsets, statefulsets | `apps` |
+| jobs, cronjobs | `batch` |
+| ingresses, networkpolicies | `networking.k8s.io` |
+| roles, rolebindings, clusterroles, clusterrolebindings | `rbac.authorization.k8s.io` |
+| storageclasses | `storage.k8s.io` |
+| horizontalpodautoscalers | `autoscaling` |
+| poddisruptionbudgets | `policy` |
+| CRDs | `apiextensions.k8s.io` |
+| gateways, httproutes | `gateway.networking.k8s.io` |
+
+`k api-resources -o wide` also shows the **VERBS** each resource supports.
+Verbs: `get list watch create update patch delete deletecollection`, plus special ones: `use`, `bind`, `escalate`, `impersonate`, `approve`. `"*"` = everything.
+
 ### Imperative (faster, fewer typos)
 ```bash
 k -n dev create role pod-reader --verb=get,list,watch --resource=pods,pods/log
@@ -229,7 +262,17 @@ k -n dev create rolebinding ci-pr --clusterrole=view --serviceaccount=dev:ci-bot
 k create clusterrole node-reader --verb=get,list,watch --resource=nodes
 k create clusterrolebinding jane-nodes --clusterrole=node-reader --user=jane
 ```
-Built-in ClusterRoles worth knowing: `cluster-admin` (everything), `admin`, `edit`, `view` (meant to be bound per namespace).
+(`--resource=deployments` usually figures out the `apps` group by itself. `deployments.apps` is the explicit form.)
+
+### Built-in ClusterRoles (reuse them instead of writing your own)
+| ClusterRole | Gives |
+|---|---|
+| `cluster-admin` | everything |
+| `admin` | everything in a namespace incl. RBAC (via a RoleBinding), but not quotas/the namespace itself |
+| `edit` | read/write most objects, no RBAC, **can read secrets** |
+| `view` | read-only, **no secrets** |
+
+Aggregated ClusterRoles: `aggregationRule.clusterRoleSelectors` merges the rules of ClusterRoles with matching labels. That's how `admin/edit/view` grow when CRDs are added.
 
 ### Verify (always, unverified = lost points)
 ```bash
@@ -238,7 +281,9 @@ k auth can-i create deployments -n dev --as=system:serviceaccount:dev:ci-bot
 k auth can-i get pods/log -n dev --as=jane
 k auth can-i '*' '*' --as=jane                                            # is she admin?
 k auth can-i --list -n dev --as=jane                                      # everything she can do
+k auth can-i get nodes --as=x --as-group=developers                       # test a GROUP's rights
 k describe rolebinding -n dev ; k get rolebindings,clusterrolebindings -A -o wide | grep jane
+k auth whoami                                                             # who am I right now?
 ```
 
 ⚠️ Traps:
@@ -290,7 +335,11 @@ Test from inside a pod:
 k exec -it pod -- sh
 TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 wget -qO- --no-check-certificate --header "Authorization: Bearer $TOKEN" https://kubernetes.default.svc/api/v1/namespaces/dev/pods
+# with curl (e.g. image curlimages/curl), verifying the server against the mounted CA:
+curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt -H "Authorization: Bearer $TOKEN" \
+  https://kubernetes.default.svc/api/v1/namespaces/dev/pods
 ```
+403 in the JSON = the token works but RBAC says no. 401 = bad token.
 
 ---
 
@@ -359,6 +408,8 @@ k -n prod run x --image=nginx       # → Error: violates PodSecurity "restricte
 A pod that passes `restricted` needs roughly: `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, `seccompProfile.type: RuntimeDefault`, no hostPath/hostNetwork/privileged.
 Existing pods are **not** evicted when you add the label. Only new pods are checked.
 
+⚠️ `enforce` applies to **pods**, so a Deployment is still created, but its **ReplicaSet can't create pods** (READY 0/3, no pods at all) → the error is in `k describe rs`. Same pattern as ResourceQuota. `warn` does show the warning at `apply` time for Deployments too.
+
 ---
 
 ## 8. Private registries and image security 🟡 MEDIUM
@@ -413,6 +464,8 @@ Then in `/etc/kubernetes/manifests/kube-apiserver.yaml`:
 volumes:
 - {name: enc, hostPath: {path: /etc/kubernetes/enc, type: DirectoryOrCreate}}
 ```
+⚠️ If `identity: {}` is listed **first**, nothing gets encrypted (the first provider is the one used for writing).
+
 ⚠️ The **mount is the step people forget**: the flag points to a path *inside* the API server container. Without the volume → API server crash-loops (`crictl logs`: no such file).
 
 Re-encrypt existing secrets and verify:
@@ -440,6 +493,10 @@ ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernete
 10. Pod-level `runAsUser: 1000`, container-level `runAsUser: 2000`. Which wins?
 11. You add `--encryption-provider-config` to the API server and it stops starting. Most likely cause?
 12. How do you check when the API server certificate expires?
+13. How do you create a User object in Kubernetes?
+14. Can you change `roleRef` on an existing binding?
+15. A Deployment in a PSA-restricted namespace shows 0/3 and `k get po` shows nothing. Where's the error?
+16. Which group bypasses RBAC completely?
 
 <details><summary>Answers</summary>
 
@@ -455,6 +512,10 @@ ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernete
 10. Container level: 2000.
 11. The config file isn't mounted into the API server pod (missing volume/volumeMount), or a YAML/key error in the file.
 12. `kubeadm certs check-expiration` or `openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -enddate`.
+13. You can't. Users come from credentials (cert CN, tokens, OIDC).
+14. No. It's immutable: delete and recreate the binding.
+15. The ReplicaSet events: `k describe rs -n <ns>`.
+16. `system:masters` (that's why `super-admin.conf` is break-glass only).
 </details>
 
 ---
@@ -476,7 +537,10 @@ ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernete
 #    read-only root FS with an emptyDir on /tmp. Verify with `id` and `touch /tmp/x` (works) and `touch /x` (fails).
 
 # E. Pod Security (5 min): label ns ps with enforce=restricted, try `k run`, read the error,
-#    then write a pod that passes.
+#    then write a pod that passes. Then create a Deployment there and find the error in `k describe rs`.
+
+# G. Group RBAC (5 min): ClusterRole "pv-reader" + ClusterRoleBinding for group "storage-team";
+#    test with k auth can-i list pv --as=x --as-group=storage-team
 
 # F. Encryption at rest (15 min, kind control plane): section 9. Create a secret before and after,
 #    compare with etcdctl get | hexdump. Then REMOVE it again cleanly (keep identity first, replace secrets, remove flag).

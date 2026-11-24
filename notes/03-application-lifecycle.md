@@ -26,6 +26,35 @@ Tags: 🔥 HIGH (must be fast) · 🟡 MEDIUM (know the steps) · 🧊 LOW (know
 
 ---
 
+## 0. Namespaces 🔥 HIGH (every task names one)
+
+### Analogies
+- 🏢 **Office building:** one building (the cluster), many floors (namespaces). Two floors can each have a room called "kitchen" (the same name in different namespaces). The lifts and electricity (Nodes, PVs, StorageClasses) are shared by every floor, so they're **not** on any floor (cluster-scoped).
+- ⚽ **Football club:** the first team, the U21 team and the women's team are separate squads. Each can have a player named "Ali". The stadium (nodes) is shared.
+
+| Namespace | What lives there |
+|---|---|
+| `default` | where your objects go if you don't say otherwise |
+| `kube-system` | control plane pods, CoreDNS, kube-proxy, CNI |
+| `kube-public` | readable by everyone (cluster-info ConfigMap) |
+| `kube-node-lease` | **Lease** objects = node heartbeats (how the control plane knows a node is alive) |
+
+- Namespaced: Pods, Deployments, Services, ConfigMaps, Secrets, PVCs, Roles, RoleBindings, NetworkPolicies, ServiceAccounts, Ingress, HTTPRoute...
+- Cluster-scoped: Nodes, PVs, StorageClasses, Namespaces, ClusterRoles, ClusterRoleBindings, PriorityClasses, CRDs, IngressClass, GatewayClass. List them: `k api-resources --namespaced=false`.
+- Every namespace automatically gets the label `kubernetes.io/metadata.name=<name>` (NetworkPolicy uses it a lot).
+- **Deleting a namespace deletes EVERYTHING in it.** Be careful in the exam.
+
+```bash
+k create ns dev
+k get all -n dev                 # "all" = pods, svc, deploy, rs, ds, sts, job, cj. NOT cm/secret/pvc/ingress/netpol
+k get po -A                      # all namespaces
+k config set-context --current --namespace=dev
+k config view --minify | grep namespace
+```
+⚠️ **Exam trap:** switch the namespace in your context, forget about it, and the next task's objects land in the wrong place. Prefer `-n <ns>` on every command, and put `namespace:` in YAML metadata.
+
+---
+
 ## 1. Rolling updates, strategies and rollbacks 🔥 HIGH
 
 ### Analogies
@@ -147,8 +176,21 @@ k create cm app-cfg --from-literal=MODE=prod --from-literal=LOG=debug
 k create cm app-cfg --from-file=app.properties             # key = file name, value = file content
 k create cm app-cfg --from-file=config=app.properties       # custom key name
 k create cm app-cfg --from-env-file=app.env                 # each KEY=VALUE line → its own key
+k create cm web --from-file=./config-dir/                  # every file in the dir becomes a key
 k create cm nginx-conf --from-file=nginx.conf $do > cm.yaml
 ```
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: app-cfg}
+data:                       # string values only (binaryData for base64 binary)
+  MODE: prod
+  app.properties: |         # a "file" stored as a key: multi-line value with |
+    color=blue
+    timeout=30
+immutable: false            # true = can never be changed. Delete and recreate to change it
+```
+Limit: **1 MiB** per ConfigMap (same for Secrets).
 
 ### 4 ways to use it in a pod
 ```yaml
@@ -200,6 +242,21 @@ spec:
 | volume mount with `subPath` | ❌ never |
 | `immutable: true` ConfigMap | can't be changed at all. Delete and recreate it |
 
+⚽ Env vars are the tactics the coach told you **in the dressing room**: changing the whiteboard afterwards doesn't reach you on the pitch. A volume mount is the **live screen on the touchline**: it updates, but the app still has to look at it (re-read the file).
+
+### 🔥 Exam pattern: "update ConfigMap X so nginx only allows TLSv1.3, and make sure the deployment uses it"
+```bash
+k -n <ns> edit cm nginx-config           # change the value. "immutable"? → get -o yaml, edit, k replace --force -f
+k -n <ns> rollout restart deploy nginx   # so the pods load the new config
+# verify: curl --tls-max 1.2 -k https://... should FAIL, TLS 1.3 should work
+```
+
+| Symptom | Cause |
+|---|---|
+| `CreateContainerConfigError` | **env** refers to a ConfigMap/Secret **or key** that doesn't exist |
+| `ContainerCreating` + event `FailedMount ... configmap "x" not found` | a **volume** refers to a missing ConfigMap |
+| Fix | create the object/key (the pod recovers by itself), or set `optional: true` |
+
 ⚠️ Traps:
 - `CreateContainerConfigError` = the ConfigMap/Secret or a **key** doesn't exist (`k describe po` says which). This is `break.sh 10`.
 - A mount on `/etc/nginx` **hides everything** that was in that folder in the image. Use `subPath` for one file.
@@ -222,11 +279,17 @@ spec:
 | `kubernetes.io/tls` | `k create secret tls x --cert=c.crt --key=c.key` | Ingress/Gateway TLS |
 | `kubernetes.io/dockerconfigjson` | `k create secret docker-registry` | private image pulls |
 | `kubernetes.io/service-account-token` | YAML + annotation | long-lived SA token (legacy) |
+| `kubernetes.io/basic-auth`, `ssh-auth` | YAML | conventions with required keys |
+
+A `tls` secret always has the keys `tls.crt` and `tls.key`.
 
 ```bash
 k create secret generic db --from-literal=user=admin --from-literal=password='p@ss!' $do
 k get secret db -o jsonpath='{.data.password}' | base64 -d; echo      # decode
 echo -n 'p@ss!' | base64                       # encode for YAML. -n = no trailing newline (common bug!)
+k create secret generic db --from-file=password=./pass.txt
+k get secret db -o jsonpath='{.data.password}' | base64 -d > /opt/pass.txt   # exam: "write the decoded value to a file"
+k create secret tls web-tls --cert=tls.crt --key=tls.key
 ```
 ```yaml
 apiVersion: v1
@@ -252,6 +315,64 @@ volumes:
 - `echo 'x' | base64` without `-n` adds `\n` to the password → "wrong password" bugs.
 - Secret volumes are tmpfs (RAM), never written to the node disk.
 - Exam tasks often say "store the decoded value in /opt/answer.txt". Decode, then `cat` the file to check.
+
+| | ConfigMap | Secret |
+|---|---|---|
+| For | non-sensitive config | passwords, keys, certs |
+| Stored as | plain text | base64 (+ optional encryption at rest, `04-security.md` §9) |
+| On the node | regular files | tmpfs (RAM) |
+| Volume field | `configMap.name` | `secret.secretName` |
+| Env field | `configMapKeyRef` / `configMapRef` | `secretKeyRef` / `secretRef` |
+| Change visible in a running pod? | env ❌ · volume ✅ · subPath ❌ | same |
+
+### Downward API: the pod learns about itself 🟡 MEDIUM
+⚽ The player looks at their own shirt to see their number and team. 🎬 Your ticket tells you your hall and seat.
+```yaml
+apiVersion: v1
+kind: Pod
+metadata: {name: whoami, labels: {app: demo}}
+spec:
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh", "-c", "env | grep MY_; cat /etc/podinfo/labels; sleep 3600"]
+    resources:
+      limits: {memory: 64Mi}
+    env:
+    - name: MY_POD_NAME
+      valueFrom: {fieldRef: {fieldPath: metadata.name}}
+    - name: MY_NAMESPACE
+      valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+    - name: MY_POD_IP
+      valueFrom: {fieldRef: {fieldPath: status.podIP}}
+    - name: MY_NODE
+      valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+    - name: MY_SA
+      valueFrom: {fieldRef: {fieldPath: spec.serviceAccountName}}
+    - name: MY_MEM_LIMIT
+      valueFrom: {resourceFieldRef: {containerName: c, resource: limits.memory}}
+    volumeMounts:
+    - {name: podinfo, mountPath: /etc/podinfo}
+  volumes:
+  - name: podinfo
+    downwardAPI:                 # labels/annotations only as FILES (they can change)
+      items:
+      - path: labels
+        fieldRef: {fieldPath: metadata.labels}
+```
+Docs search: "**Expose Pod Information to Containers Through Environment Variables**".
+
+**Projected volume** = several sources in one directory:
+```yaml
+volumes:
+- name: all-in-one
+  projected:
+    sources:
+    - configMap: {name: app-cfg}
+    - secret: {name: db}
+    - downwardAPI: {items: [{path: labels, fieldRef: {fieldPath: metadata.labels}}]}
+    - serviceAccountToken: {path: token, expirationSeconds: 3600, audience: vault}
+```
 
 ---
 
@@ -367,6 +488,9 @@ resources:
   requests: {cpu: 250m, memory: 128Mi}   # used by the SCHEDULER
   limits:   {cpu: 500m, memory: 256Mi}   # enforced by the KUBELET/kernel
 ```
+- The scheduler compares requests with the node's **Allocatable** (capacity minus system/kubelet reservations), not its Capacity.
+- Over the CPU limit → **throttled**. Over the memory limit → **OOMKilled** (exit 137).
+- Only limits set → requests default to the limits.
 
 ### LimitRange (per container/pod defaults and min/max in ONE namespace)
 ```yaml
@@ -381,13 +505,21 @@ spec:
     max:            {cpu: "1",  memory: 1Gi}
     min:            {cpu: 50m,  memory: 64Mi}
 ```
-Applied **only when pods are created**. Existing pods aren't changed.
+Applied **only when pods are created** (LimitRanger admission). Existing pods aren't changed.
+Violations → the pod is **rejected**: `forbidden: maximum cpu usage per Container is 1`. A `type: PersistentVolumeClaim` entry can cap PVC sizes too (`max: {storage: 5Gi}`).
 
 ### ResourceQuota (totals for the whole namespace)
 ```bash
 k create quota dev-q -n dev --hard=pods=10,requests.cpu=2,requests.memory=2Gi,limits.cpu=4,limits.memory=4Gi,services=5,persistentvolumeclaims=3
 k describe quota -n dev          # Used vs Hard
 ```
+Other useful keys: `count/deployments.apps: "2"` (any kind: `count/<resource>.<group>`), `services.nodeports: "0"`, `requests.storage: 10Gi`, `configmaps: "10"`.
+
+| | LimitRange | ResourceQuota |
+|---|---|---|
+| Scope | **per container/pod/PVC** | **total for the namespace** |
+| Sets defaults? | ✅ | ❌ |
+| 🍽 | the size of each plate | the budget for the whole party |
 ⚠️ If a quota covers `requests.cpu`, **every new pod must set a CPU request** (or get one from a LimitRange), otherwise: `forbidden: failed quota: must specify requests.cpu`. Deployments then show 0 pods and the error is on the **ReplicaSet** events: `k describe rs`.
 
 ### Exam pattern: "split the node's resources evenly across N replicas"
@@ -420,6 +552,8 @@ k get po -o wide                        # all Running?
 
 HPA needs **metrics-server** (your `up.sh` installs it) and **CPU requests** on the pods (utilization % = usage / request).
 
+**How it decides:** every ~15 s → `desired = ceil(current × currentUtil / targetUtil)` → updates `replicas` on the Deployment. Example: 2 pods at 90% with target 50% → ceil(2 × 90/50) = 4.
+
 ```bash
 k autoscale deploy php --min=1 --max=5 --cpu-percent=50 $do > hpa.yaml   # newer kubectl may prefer --cpu=50% (see k autoscale -h)
 k get hpa                         # TARGETS <unknown>/50% → metrics-server missing OR no cpu request
@@ -449,7 +583,14 @@ spec:
     scaleUp:
       stabilizationWindowSeconds: 0
 ```
+⚠️ `kubectl autoscale` **can't set `behavior`**. Generate with `$do`, add `behavior`, then apply.
 Docs page to bookmark: "HorizontalPodAutoscaler Walkthrough" and "Horizontal Pod Autoscaling" (has the `behavior` examples).
+
+| HPA symptom | Cause |
+|---|---|
+| TARGETS `<unknown>/50%` | metrics-server missing/broken, **or** no CPU request on the containers |
+| Doesn't scale down right away | stabilization window (default 5 min) |
+| Never goes over N | `maxReplicas`, or a ResourceQuota blocks new pods |
 
 **VPA** 🧊: a separate add-on (CRD `VerticalPodAutoscaler`), modes `Off` (recommend only), `Initial`, `Recreate`, `InPlaceOrRecreate` (newer). Know it exists.
 **In-place pod resize** 🟡: newer Kubernetes can change CPU/memory of a running container without a restart, via the `resize` subresource (`k patch pod x --subresource resize -p ...`) and `resizePolicy` per container. Know the idea.
@@ -530,6 +671,10 @@ spec:
 10. A CronJob must not start a new run if the previous one is still running. Which field and value?
 11. How do you run a CronJob immediately to test it?
 12. You must add a container to an existing bare pod. How?
+13. Which namespace holds node heartbeats, and as what kind of object?
+14. What's wrong with `volumes: - name: s  secret: {name: db}`?
+15. `echo 'pass' | base64` was used to create a secret, and the DB login fails. Why?
+16. LimitRange vs ResourceQuota in one sentence each.
 
 <details><summary>Answers</summary>
 
@@ -545,6 +690,10 @@ spec:
 10. `concurrencyPolicy: Forbid`.
 11. `k create job test --from=cronjob/<name>`.
 12. Export YAML, edit, `k replace --force -f pod.yaml` (delete + recreate).
+13. `kube-node-lease`, as `Lease` objects.
+14. For secret volumes the field is `secretName`, not `name`.
+15. Without `-n`, echo adds a newline, so the stored value is `pass\n`.
+16. LimitRange = per-container defaults and min/max. ResourceQuota = the total budget for the namespace.
 </details>
 
 ---

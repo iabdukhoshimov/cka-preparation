@@ -86,6 +86,8 @@ k get deploy,rs -n x                 # RS exists? DESIRED vs CURRENT?
 k describe rs <rs> -n x              # Events: "forbidden: exceeded quota", "failed quota: must specify requests"...
 k -n kube-system get po | grep controller-manager   # no RS at all → controller-manager down (break.sh 8)
 ```
+Typical RS events: **quota exceeded**, **PodSecurity violation**, ServiceAccount doesn't exist, admission webhook denial.
+Rollout stuck halfway → `k rollout status`, describe the NEW pods (bad image / failing readiness) → `k rollout undo`.
 
 ---
 
@@ -108,6 +110,9 @@ Fixing a deployment: `k edit deploy`, or `k set image/env/resources`, then `k ro
 k debug -it <pod> --image=busybox:1.36 --target=<container>   # joins the process namespace of that container
 k debug <pod> -it --image=busybox:1.36 --copy-to=dbg --share-processes   # debug a COPY of the pod
 k debug node/cka-worker -it --image=busybox:1.36             # a pod on the node, host FS at /host (chroot /host)
+k debug <pod> -it --copy-to=<pod>-dbg --container=<c> -- sh   # copy with a different command: keeps a crashing pod alive
+k run t --rm -it --restart=Never --image=nicolaka/netshoot -- bash   # full network toolbox (if images can be pulled)
+k get po <pod> -o jsonpath='{.status.containerStatuses[*].lastState}'
 ```
 
 ---
@@ -125,6 +130,25 @@ Full flow in [[06-networking]] §8. The short version:
 | NodePort doesn't answer | `k get svc` nodePort, kube-proxy pods | wrong port, kube-proxy down |
 | all pods on one node unreachable | CNI pods on that node, `k get no` | CNI/calico-node crash on that node |
 | Ingress/Gateway 404 | `k describe ing/httproute` | Host header, path, class, backend name/port |
+| only cross-namespace names fail | — | used `svc` instead of `svc.ns` |
+| everything times out in one namespace | `k get netpol -n ns` | a default-deny NetworkPolicy |
+| services fail on one node only | kube-proxy pod on that node | kube-proxy crashed there |
+
+### 🔥 The 4-test service ladder: test from the inside out
+```bash
+k get svc web -o wide ; k get endpointslices -l kubernetes.io/service-name=web   # 1. endpoints empty?
+k get po -l <selector> --show-labels       # compare carefully: "app=web" vs "app=Web", "tier" vs "tire"
+k exec <pod> -- netstat -tlnp 2>/dev/null || k exec <pod> -- ss -tlnp   # 2. what REALLY listens in the container
+k run t --rm -it --restart=Never --image=busybox:1.36 -- wget -qO- -T2 <podIP>:<port>       # 3. pod directly
+k run t --rm -it --restart=Never --image=busybox:1.36 -- wget -qO- -T2 <clusterIP>:<port>   # 4. service by IP
+k run t --rm -it --restart=Never --image=busybox:1.36 -- wget -qO- -T2 web.<ns>:<port>      # 5. service by name
+```
+| Result | Broken layer |
+|---|---|
+| pod IP ✅, svc IP ✅, svc name ❌ | **DNS** |
+| pod IP ✅, svc IP ❌ | **endpoints / selector / targetPort**, or kube-proxy |
+| pod IP ❌ (timeout) | **NetworkPolicy** or CNI |
+| "connection refused" anywhere | you reached it, but the **port is wrong** (nothing listens) |
 
 ---
 
@@ -173,6 +197,12 @@ watch crictl ps
 | YAML indentation broken | pod never appears; `journalctl -u kubelet` shows `could not process manifest file` |
 | wrong `hostPath` / volume | `no such file or directory` / CrashLoop |
 | wrong advertise address / probe port | probes fail → keeps restarting |
+| wrong image tag (`kube-apiserver:v1.37.99`) | `ErrImagePull` in `crictl`/kubelet logs |
+| scheduler/KCM `resources.requests.cpu` set huge (e.g. `4`) | the static pod can't start on the node |
+| a `kube-apiserver.yaml.bak` left **inside** `/etc/kubernetes/manifests/` | duplicate/conflicting static pods → move backups out |
+
+> [!important]
+> **Static pod edits: you never `kubectl apply` them.** Edit the file on disk and the kubelet notices. Editing the mirror pod with `k edit` does nothing. If nothing happens after ~2 minutes: `systemctl restart kubelet`.
 
 ---
 
@@ -205,6 +235,11 @@ df -h ; free -m                             # DiskPressure / MemoryPressure
 | `container runtime is down` / `connect: no such file ... containerd.sock` | containerd stopped | `systemctl enable --now containerd` |
 | `network plugin is not ready: cni config uninitialized` | CNI missing / crashed | install/fix the CNI, check `/etc/cni/net.d` |
 | kubelet binary path wrong in the unit | `status=203/EXEC` | fix `ExecStart` path (`which kubelet`), `daemon-reload` |
+| `x509: certificate has expired` | kubelet client cert | rotate/renew |
+| `node "x" not found` | wrong `--hostname-override` | fix the flag |
+| `running with swap on is not supported` | swap | `swapoff -a` (+ comment it in `/etc/fstab`) |
+
+Other node conditions: `MemoryPressure`/`DiskPressure` → evictions: `df -h`, `free -m`, `crictl rmi --prune` (remove unused images). `SchedulingDisabled` → cordoned → `k uncordon`.
 
 **After every kubelet config change:** `systemctl daemon-reload` (if you changed unit files) and `systemctl restart kubelet`. Then `exit` and `k get no` (wait ~30–60s).
 
@@ -298,6 +333,16 @@ cat /opt/top-pod.txt          # ALWAYS
 7. **Persist** fixes: `systemctl enable`, sysctl in `/etc/sysctl.d/`, manifests on disk (not `k edit` of a mirror pod, which does nothing).
 8. Verify, then `exit` the ssh session.
 
+### The 5-minute triage script for any broken task
+```bash
+k config use-context <ctx>                           # ALWAYS
+k get nodes ; k get po -A | grep -vE 'Running|Completed'
+k -n <ns> get all,cm,secret,pvc,netpol,ingress
+k -n <ns> describe <the broken thing> | tail -20
+k -n <ns> logs <pod> --previous --tail=30
+# fix → verify with the SAME check the task describes (curl, can-i, get, logs)
+```
+
 ---
 
 ## 9. Self-check: "what would you do?"
@@ -312,6 +357,10 @@ cat /opt/top-pod.txt          # ALWAYS
 8. You edited `kube-apiserver.yaml`, 5 minutes later there's still no API server container in `crictl ps -a`.
 9. Deployment stuck at 2/3, the third pod is Pending with `0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: }, 2 Insufficient memory`.
 10. You fixed kubelet on node01 with `systemctl start kubelet`. Is the task fully done?
+11. Exit code 127 means? 137?
+12. A service works via the pod IP but not via the service IP. Suspects?
+13. How do you debug a running container whose image has no shell?
+14. You fixed a typo in kube-apiserver.yaml, but nothing changes after 3 minutes. What now?
 
 > [!success]- Answers
 > 1. Scheduler is down (check kube-system pods/logs, its manifest), or `schedulerName` points to a scheduler that doesn't exist.
@@ -324,10 +373,29 @@ cat /opt/top-pod.txt          # ALWAYS
 > 8. The manifest probably has a YAML error → `journalctl -u kubelet | grep -i manifest`, or a missing file in a hostPath. Compare with your backup.
 > 9. The workers lack memory for the request → lower the request (or free resources). Don't remove the control-plane taint unless asked.
 > 10. No. `systemctl enable kubelet` too, so it survives a reboot.
+> 11. 127 = command not found. 137 = SIGKILL (OOMKilled or forced kill).
+> 12. Empty endpoints (selector/labels/readiness), wrong targetPort, kube-proxy.
+> 13. `k debug -it <pod> --image=busybox:1.36 --target=<container>` (an ephemeral container).
+> 14. Check the YAML is valid (`journalctl -u kubelet`), check for backup files in the manifests dir, `systemctl restart kubelet`.
 
 ---
 
 ## 10. Practice plan with your lab
+
+| `./troubleshoot/break.sh N` | Area | Skill |
+|---|---|---|
+| 1 | scheduling | Pending → describe → taint/requests/selector |
+| 2 | node (cka-worker2) | kubelet service → journalctl |
+| 3 | node (cka-worker) | kubelet config (clientCAFile) |
+| 4 | API server | etcd port in the manifest, via crictl |
+| 5 | service | selector/targetPort → endpoints |
+| 6 | DNS | CoreDNS |
+| 7 | NetworkPolicy | allow only frontend → backend |
+| 8 | controller-manager | 0 pods → KCM kubeconfig path |
+| 9 | storage | PVC Pending → StorageClass |
+| 10 | config | ConfigMap/env-related app failure |
+
+Extra practice: `references/cka-certification-guide/PRACTICE_QUESTIONS.md` Q22–Q33 and `references/*/troubleshooting.md`.
 
 ```bash
 ./troubleshoot/break.sh list

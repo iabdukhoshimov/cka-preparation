@@ -84,7 +84,17 @@ nslookup / dig, curl, nc -zv host port         # basic connectivity
 2. Every pod can reach every other pod **directly, without NAT**, on any node.
 3. Agents on a node (kubelet) can reach all pods on that node.
 
+The **pause** container is created first and holds the pod's network namespace. The app containers join it.
+
 Kubernetes **doesn't implement** this. A **CNI plugin** does (Calico, Cilium, Flannel, Weave...).
+
+🏙 **City picture:** every pod is a **house with its own address**. Containers in the pod are family members sharing the house (same IP, talk via `localhost`). Any house can send a letter to any other house, even in another district (node), **without rewriting the address on the envelope (no NAT)**.
+
+| Address range | Set by | Must not overlap with |
+|---|---|---|
+| **Node IPs** | the infrastructure | pod + service ranges |
+| **Pod CIDR** (e.g. 192.168.0.0/16) | `kubeadm init --pod-network-cidr` → controller-manager `--cluster-cidr` + the CNI config | node + service ranges |
+| **Service CIDR** (e.g. 10.96.0.0/12) | kube-apiserver `--service-cluster-ip-range` | node + pod ranges |
 
 > [!example]+ Analogies
 > - 🛣 **Road builders:** Kubernetes says "every house must have an address and every house must reach every other house". It hires a construction company (CNI) to build the roads. No CNI → houses with no roads → nodes `NotReady` with `network plugin not ready: cni plugin not initialized`, and pods stuck in `ContainerCreating`.
@@ -168,6 +178,46 @@ Empty endpoints = selector mismatch **or** pods not Ready. That's the #1 Service
 - `sessionAffinity: ClientIP` = the same client keeps hitting the same pod (🍽 your usual waiter).
 - `externalTrafficPolicy: Local` = NodePort/LB only goes to pods on the node that received the traffic (keeps the client IP).
 
+### Advanced Service fields, annotated 🟡 MEDIUM
+```yaml
+apiVersion: v1
+kind: Service
+metadata: {name: web}
+spec:
+  type: NodePort
+  selector: {app: web}
+  ports:
+  - name: http                    # names are REQUIRED once there is more than one port
+    port: 80
+    targetPort: http              # NAMED port → follows the containerPort named "http", even if its number changes
+    nodePort: 30080
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+  sessionAffinity: ClientIP       # sticky: same client → same pod
+  externalTrafficPolicy: Local    # + keeps the client's source IP; − nodes without a local pod drop the traffic
+  internalTrafficPolicy: Cluster  # Local = in-cluster traffic only goes to pods on the same node
+  publishNotReadyAddresses: false # true = include NOT-ready pods (StatefulSet peer discovery)
+```
+
+### 🔥 Exam pattern: "add a container port to a deployment and expose it on a NodePort"
+```bash
+k -n <ns> edit deploy front-end       # under the container:  ports: [{containerPort: 80, name: http, protocol: TCP}]
+k -n <ns> expose deploy front-end --name=front-end-svc --port=80 --target-port=80 --type=NodePort
+k -n <ns> get svc front-end-svc ; k -n <ns> get endpointslices -l kubernetes.io/service-name=front-end-svc
+curl http://<nodeIP>:<nodePort>       # verify (kind: docker exec cka-worker curl -s localhost:<nodePort>)
+```
+If the task names a specific nodePort, `expose` can't set it: `k edit svc` (or `$do` → edit the YAML → apply).
+
+### Other ways traffic gets in (know what they are)
+| Tool | What |
+|---|---|
+| `k port-forward svc/web 8080:80` | a tunnel from **your terminal** to the service. Debug only |
+| `hostNetwork: true` (pod) | the pod uses the **node's** network namespace and IP. Ports clash with the node |
+| `hostPort` (container) | maps one port on the node to the pod (pod Pending if the port is taken) |
+| ExternalName Service | a DNS CNAME to an outside name |
+| Service without a selector + a manual EndpointSlice | points to IPs outside the cluster |
+
 ---
 
 ## 4. DNS and CoreDNS 🔥 HIGH
@@ -222,7 +272,20 @@ grep -A2 clusterDNS /var/lib/kubelet/config.yaml   # kubelet tells pods which DN
     reload
 }
 ```
-Exam-style edits: add `rewrite name ...`, add a stub domain (`example.local:53 { forward . 10.0.0.53 }`), change `forward`. After editing the ConfigMap, the `reload` plugin picks it up, or `k -n kube-system rollout restart deploy coredns`.
+Exam-style edits (inside the `.:53 { }` block unless noted):
+```
+    hosts {                         # static entries
+       10.0.0.50 legacy.example.com
+       fallthrough                  # ← without this, every other name fails!
+    }
+    forward . 8.8.8.8 1.1.1.1      # other upstream DNS servers
+    rewrite name foo.example.com web.default.svc.cluster.local
+# stub domain = a SEPARATE server block next to .:53
+corp.example.com:53 {
+    forward . 10.0.0.53
+}
+```
+After editing the ConfigMap the `reload` plugin picks it up (~30s+), or faster: `k -n kube-system rollout restart deploy coredns`.
 
 ### dnsPolicy
 | dnsPolicy | Pod uses |
@@ -237,7 +300,13 @@ Exam-style edits: add `rewrite name ...`, add a stub domain (`example.local:53 {
 k run dns --image=busybox:1.36 --rm -it --restart=Never -- nslookup web.prod
 k run dns --image=busybox:1.36 --rm -it --restart=Never -- nslookup kubernetes.default
 ```
-Use `busybox:1.36` or later 1.x: very old busybox images had a broken `nslookup`.
+Use `busybox:1.36` or later 1.x: very old busybox images had a broken `nslookup`. Fallback with real `dig`: `registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3`.
+
+Exam style "write the result to a file": run it **without** `-it` so no terminal junk lands in the file:
+```bash
+k run dns --image=busybox:1.36 --rm -i --restart=Never -- nslookup web.prod > /opt/dns.txt
+cat /opt/dns.txt                     # remove a trailing 'pod "dns" deleted' line if it got in
+```
 
 ### DNS troubleshooting order
 1. CoreDNS pods Running? (`k -n kube-system get po -l k8s-app=kube-dns`) → if not: image, CrashLoop (often a Corefile typo or `loop` detected).
@@ -245,6 +314,10 @@ Use `busybox:1.36` or later 1.x: very old busybox images had a broken `nslookup`
 3. Pod's `/etc/resolv.conf` points to the kube-dns ClusterIP? (kubelet `clusterDNS`)
 4. A NetworkPolicy blocks egress to port 53? (very common in NetworkPolicy tasks!)
 5. You used the short name across namespaces?
+6. The Corefile itself: typo in the `kubernetes cluster.local` line (e.g. `cluster.lcoal`), wrong `forward`.
+7. CoreDNS CrashLoop with `[FATAL] plugin/loop: Loop ... detected` → `forward` points back at itself (node resolv.conf → `127.0.0.53`). Forward to a real upstream IP instead.
+
+Recognize a DNS problem: **by IP it works, by name it doesn't.**
 
 ---
 
@@ -331,16 +404,69 @@ spec: {podSelector: {}, egress: [{}], policyTypes: [Egress]}
 | `ingress: [{}]` | allow all ingress |
 | `from: []` or `from` missing in a rule | from anywhere (only ports restrict) |
 | `podSelector: {}` in `from` | all pods **in this namespace** |
+| `ingress: []` | deny all ingress (same as missing) |
 | `namespaceSelector: {}` in `from` | all pods in **all** namespaces |
 
 Every namespace has the automatic label `kubernetes.io/metadata.name=<name>`. Use it instead of adding your own labels.
+
+### Full copy-paste policies
+```yaml
+# allow DNS egress for every pod in the namespace (add this whenever you restrict egress)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns, namespace: app}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: kube-system}
+      podSelector:
+        matchLabels: {k8s-app: kube-dns}
+    ports:
+    - {protocol: UDP, port: 53}
+    - {protocol: TCP, port: 53}
+---
+# only frontend → backend on port 80 (same namespace)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: backend-from-frontend, namespace: app}
+spec:
+  podSelector:
+    matchLabels: {app: backend}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels: {app: frontend}
+    ports:
+    - {protocol: TCP, port: 80}
+```
+Port range: `ports: [{protocol: TCP, port: 30000, endPort: 32768}]`.
 
 ### Exam pattern: "choose / write the LEAST permissive policy"
 Typically 3 policies are given in files. Read each one and ask: does it allow **exactly** the needed flow (right pods, right namespace, right port), and nothing more? Reject ones with `namespaceSelector: {}` alone, missing ports, or OR where AND was needed. Apply the chosen one, then **test both** the allowed and a not-allowed path:
 ```bash
 k -n prod exec deploy/api -- nc -zv -w2 db 5432          # should work (if nc exists in the image)
 k -n prod run t --rm -it --image=busybox:1.36 --restart=Never -- nc -zv -w2 db 5432   # should time out
+k -n app run t --rm -it --restart=Never --image=busybox:1.36 --labels=app=frontend -- wget -qO- -T2 http://backend   # test AS a labelled pod
+k -n prod describe netpol db-policy      # prints the rules in plain English: great for checking AND vs OR
 ```
+Judge a candidate in 4 steps: (1) does `podSelector` select exactly the target pods? (2) does `from` allow only the needed source (no `{}`, no whole namespace, no `0.0.0.0/0`)? (3) AND vs OR: count the dashes. (4) ports restricted?
+
+### 🔥 Read the error to know WHAT is blocking you
+| Test result | Most likely |
+|---|---|
+| **timeout** (`download timed out`) | a NetworkPolicy dropped it (or routing/CNI) |
+| **connection refused** | you reached the pod, but nothing listens on that port → wrong targetPort/containerPort. Not a policy |
+| **bad address / could not resolve** | DNS, or DNS egress blocked by a policy |
+
+### What NetworkPolicy can NOT do 🧊 LOW
+- No deny rules (only allow; isolation comes from being selected).
+- No L7 (HTTP paths), no TLS, no logging. That needs Cilium/Calico CRDs or a service mesh.
+- Can't target a Service by name: only pod labels, namespace labels and IP blocks.
+- hostNetwork/node traffic behaviour is CNI-specific.
 
 ---
 
@@ -391,8 +517,18 @@ k get ingressclass ; k -n web describe ingress shop     # check the backends res
 curl -H "Host: shop.example.com" http://<node-ip>:<ingress-nodeport>/pay
 curl --resolve shop.example.com:443:<ip> -k https://shop.example.com/pay
 ```
+| pathType | `/shoes` matches |
+|---|---|
+| Prefix | `/shoes`, `/shoes/`, `/shoes/red`, but **not** `/shoesale` (matching is per path element) |
+| Exact | only `/shoes` |
+| ImplementationSpecific | whatever the controller decides |
+
+`k get ingress` → **ADDRESS filled in = a controller picked it up.** Empty ADDRESS = no controller, or the class doesn't match.
+
 > [!warning]
 > Traps: wrong `ingressClassName`, Service in another namespace (not allowed), wrong service **port** (it's the Service port, not the targetPort), forgetting `pathType` (required).
+
+Ingress limits (why Gateway API exists): only host + path matching; headers, weights, rewrites, timeouts need **non-portable annotations**; one object mixes infra (TLS, class) with app routing; HTTP(S) only.
 Note: the community **ingress-nginx** project announced its retirement (2025–2026), which is one reason the exam now pushes Gateway API. Ingress itself is still a stable API.
 
 ---
@@ -483,7 +619,47 @@ spec:
     - type: RequestRedirect
       requestRedirect: {scheme: https, statusCode: 301}
 ```
-Other filters: `URLRewrite` (like the nginx rewrite annotation: `urlRewrite: {path: {type: ReplacePrefixMatch, replacePrefixMatch: /}}`), `RequestHeaderModifier`, `RequestMirror`.
+Matching logic: several `matches` in one rule are **ORed**. The conditions inside **one** match (path + headers + method) are **ANDed**.
+
+### Filters (what Ingress needed annotations for)
+```yaml
+  rules:
+  - matches: [{path: {type: PathPrefix, value: /old}}]
+    filters:
+    - type: URLRewrite                 # /old/x → /new/x
+      urlRewrite:
+        path: {type: ReplacePrefixMatch, replacePrefixMatch: /new}
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        add: [{name: x-from, value: gateway}]
+        remove: [x-debug]
+    backendRefs: [{name: web, port: 80}]
+```
+Other filter types: `RequestRedirect` (above), `RequestMirror`, `ResponseHeaderModifier`.
+
+### Cross-namespace backend → ReferenceGrant 🧊 LOW
+The **owner of the target** has to allow it, so the grant lives in the **backend's** namespace:
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: allow-web-routes, namespace: shop}   # the TARGET namespace
+spec:
+  from:
+  - {group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: web}
+  to:
+  - {group: "", kind: Service}
+```
+🎉 You can't invite guests to **someone else's** house. The owner has to say "yes, guests from that party may come in".
+
+### Status: how to know it works 🔥
+```bash
+k get gatewayclass                  # ACCEPTED=True → the controller is running
+k -n web get gateway web-gw         # PROGRAMMED=True and an ADDRESS
+k -n web describe gateway web-gw    # per-listener conditions: bad cert secret → ResolvedRefs=False
+k -n web get httproute shop -o yaml | grep -A20 'status:'
+#   Accepted=False     → wrong parentRef name/sectionName, hostname doesn't fit the listener, allowedRoutes blocks the ns
+#   ResolvedRefs=False → backend Service/port doesn't exist (BackendNotFound), or cross-ns without a ReferenceGrant
+```
 
 ### 🔥 Exam pattern: migrate an Ingress to Gateway API
 | Ingress field | Gateway API |
@@ -501,7 +677,50 @@ Steps: read the Ingress (`k get ing x -o yaml`) → write the Gateway (listeners
 k -n web get gateway web-gw          # PROGRAMMED=True, an ADDRESS
 k -n web describe httproute shop     # Conditions: Accepted=True, ResolvedRefs=True (else: wrong svc name/port, or listener/hostname mismatch)
 ```
-Cross-namespace backends need a `ReferenceGrant` in the backend's namespace (🧊 rarely asked).
+
+Full worked example. Task: "migrate Ingress `web` (host `gateway.web.k8s.local`, TLS secret `web-tls`) to Gateway `web-gateway` (class `nginx`) + HTTPRoute `web-route`":
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: web-gateway}
+spec:
+  gatewayClassName: nginx
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 443
+    hostname: gateway.web.k8s.local
+    tls:
+      mode: Terminate
+      certificateRefs: [{kind: Secret, name: web-tls}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web-route}
+spec:
+  parentRefs: [{name: web-gateway}]
+  hostnames: [gateway.web.k8s.local]
+  rules:
+  - matches: [{path: {type: PathPrefix, value: /}}]
+    backendRefs: [{name: web-service, port: 80}]
+```
+```bash
+curl -k --resolve gateway.web.k8s.local:443:<ip> https://gateway.web.k8s.local/
+k delete ingress web                 # only if the task says so, and AFTER verifying
+```
+There's **no imperative command** for Gateway API. Copy from the kubernetes.io "Gateway API" page, or use `k explain`.
+
+### Ingress vs Gateway API side by side
+| | Ingress | Gateway API |
+|---|---|---|
+| API | `networking.k8s.io/v1` (built in) | `gateway.networking.k8s.io/v1` (CRDs, installed separately) |
+| Objects | Ingress (+ IngressClass) | GatewayClass, Gateway, HTTPRoute (+ GRPCRoute, TLSRoute, ReferenceGrant) |
+| Roles | one object for everyone | infra / operator / developer separated |
+| Matching | host, path | host, path, **headers, query params, method** |
+| Traffic split | annotations (non-portable) | `weight` built in |
+| Rewrites/redirects | annotations | `filters` built in |
+| Cross-namespace | no | `allowedRoutes` + ReferenceGrant |
+| Imperative | `k create ingress` | none: write YAML |
 
 ---
 
@@ -537,6 +756,12 @@ Can't reach the app?
 10. HTTPRoute shows `ResolvedRefs: False`. Most likely cause?
 11. Where do you find the Service CIDR?
 12. Nodes `NotReady` right after `kubeadm init`, kubelet log says `cni plugin not initialized`. Fix?
+13. A test gives "connection refused". Is a NetworkPolicy to blame?
+14. Two policies select the same pod: one allows from A, the other from B. What gets in?
+15. `ingress: [{}]` vs `ingress: []`?
+16. How do you send 10% of traffic to v2 with Gateway API?
+17. Ingress created, ADDRESS stays empty. Most likely reason?
+18. You changed the containerPort number of a deployment. Which Service field style keeps working without edits?
 
 > [!success]- Answers
 > 1. No (usually): it's a virtual IP handled by kube-proxy rules for specific ports, not an interface. Test with curl/wget on the port.
@@ -551,6 +776,12 @@ Can't reach the app?
 > 10. Backend Service name or port wrong (or a cross-namespace backend without ReferenceGrant).
 > 11. `--service-cluster-ip-range` in the kube-apiserver manifest (also `kubeadm-config` ConfigMap).
 > 12. Install a CNI (e.g. Calico) with the right pod CIDR.
+> 13. Probably not. Policies drop packets (timeout). "Refused" = nothing listens on that port.
+> 14. A and B (the union).
+> 15. `[{}]` = allow all. `[]` = deny all.
+> 16. Two `backendRefs` with `weight: 90` and `weight: 10`.
+> 17. No ingress controller is running, or `ingressClassName` doesn't match an existing IngressClass.
+> 18. A **named** `targetPort` (e.g. `targetPort: http`).
 
 ---
 
@@ -575,6 +806,11 @@ Can't reach the app?
 # E. Weights (5 min): 80/20 split between two deployments that return different text. curl 20 times, count.
 
 # F. break.sh 5, 6, 7 again (10 min). Each one is a networking problem.
+
+# G. CoreDNS (10 min): add a hosts entry "10.1.2.3 legacy.local" (with fallthrough!) → resolve it from a pod.
+#    Then scale coredns to 0: nslookup fails, wget to a pod IP still works → scale back.
+
+# H. Gateway status (5 min): typo the parentRef name → HTTPRoute Accepted=False. Typo the backend svc → ResolvedRefs=False.
 ```
 
 ---
