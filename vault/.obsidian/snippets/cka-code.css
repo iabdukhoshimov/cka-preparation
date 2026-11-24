@@ -27,3 +27,15 @@ body {
   white-space: pre !important;
   word-break: normal !important;
 }
+
+/* 3. Smaller monospace in the editing view too, so diagrams fit better */
+.markdown-source-view.mod-cm6 .HyperMD-codeblock,
+.markdown-source-view.mod-cm6 .cm-inline-code {
+  font-size: 0.85em;
+}
+
+/* 4. Wide tables scroll sideways instead of squashing the columns */
+.markdown-rendered table {
+  display: block;
+  overflow-x: auto;
+}
