@@ -2,3 +2,4 @@ drills/work/
 *.db
 vault/.obsidian/workspace*.json
 notes/.obsidian/
+.obsidian/workspace*.json
